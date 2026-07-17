@@ -117,7 +117,8 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-monitor_started = False
+monitor_task: asyncio.Task | None = None
+scan_lock = asyncio.Lock()
 alerted_products: dict[str, float] = {}
 
 
@@ -1103,57 +1104,66 @@ async def send_product_alert(product: dict):
 
 
 async def scan_all_targets_once(send_alerts: bool = True) -> list[dict]:
-    results = []
-    targets = await asyncio.to_thread(expand_monitor_targets)
+    if scan_lock.locked():
+        log("上一輪掃描尚未完成，本輪跳過")
+        return []
 
-    log(f"本輪實際掃描商品數：{len(targets)}")
+    async with scan_lock:
+        results = []
+        targets = await asyncio.to_thread(expand_monitor_targets)
 
-    for target in targets:
-        product_url = target["url"]
-        fallback_name = target.get("name") or "Funbox 商品"
+        log(f"本輪實際掃描商品數：{len(targets)}")
 
-        log(f"開始確認商品頁：{product_url}")
+        for target in targets:
+            product_url = target["url"]
+            fallback_name = target.get("name") or "Funbox 商品"
 
-        result = await asyncio.to_thread(scan_funbox_product, product_url, fallback_name)
+            log(f"開始確認商品頁：{product_url}")
 
-        results.append(result)
+            result = await asyncio.to_thread(
+                scan_funbox_product,
+                product_url,
+                fallback_name,
+            )
 
-        log(
-            f"掃描結果：available={result['available']} "
-            f"name={result['name']} "
-            f"price={result['price_text']} "
-            f"reason={result['reason']}"
-        )
+            results.append(result)
 
-        key = result["url"].split("?")[0]
+            log(
+                f"掃描結果：available={result['available']} "
+                f"name={result['name']} "
+                f"price={result['price_text']} "
+                f"reason={result['reason']}"
+            )
 
-        if result["available"]:
-            if key not in alerted_products:
-                product = {
-                    "name": result["name"],
-                    "price": result["price_text"],
-                    "url": result["url"],
-                    "reason": result["reason"],
-                }
+            key = result["url"].split("?")[0]
 
-                if send_alerts:
-                    sent = await send_product_alert(product)
+            if result["available"]:
+                if key not in alerted_products:
+                    product = {
+                        "name": result["name"],
+                        "price": result["price_text"],
+                        "url": result["url"],
+                        "reason": result["reason"],
+                    }
 
-                    if sent:
-                        alerted_products[key] = time.time()
-                        log(f"已發送有貨通知：{result['name']}")
+                    if send_alerts:
+                        sent = await send_product_alert(product)
+
+                        if sent:
+                            alerted_products[key] = time.time()
+                            log(f"已發送有貨通知：{result['name']}")
+                        else:
+                            log("通知發送失敗，不記錄已通知狀態")
                     else:
-                        log("通知發送失敗，不記錄已通知狀態")
+                        log("send_alerts=False，不發送 Discord 通知")
                 else:
-                    log("send_alerts=False，不發送 Discord 通知")
+                    log("此商品已通知過，略過避免洗版")
             else:
-                log("此商品已通知過，略過避免洗版")
-        else:
-            if key in alerted_products:
-                log("商品目前無貨，解除已通知狀態，等待下次重新補貨")
-                alerted_products.pop(key, None)
+                if key in alerted_products:
+                    log("商品目前無貨，解除已通知狀態，等待下次重新補貨")
+                    alerted_products.pop(key, None)
 
-    return results
+        return results
 
 
 async def monitor_funbox_loop():
@@ -1169,24 +1179,51 @@ async def monitor_funbox_loop():
     log(f"白名單關鍵字：{', '.join(FUNBOX_PRODUCT_KEYWORDS)}")
     log(f"黑名單關鍵字：{', '.join(FUNBOX_EXCLUDE_KEYWORDS)}")
 
-    while not bot.is_closed():
-        try:
-            if not FUNBOX_MONITOR_ENABLED:
+    try:
+        while not bot.is_closed():
+            try:
+                if not FUNBOX_MONITOR_ENABLED:
+                    log("Funbox 監控目前停用，等待下一輪")
+                    await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                log("開始新一輪 Funbox 掃描")
+                await scan_all_targets_once(send_alerts=True)
+                log(
+                    f"本輪 Funbox 掃描完成，"
+                    f"{FUNBOX_MONITOR_INTERVAL_SECONDS} 秒後再掃描"
+                )
+
                 await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)
-                continue
 
-            await scan_all_targets_once(send_alerts=True)
+            except asyncio.CancelledError:
+                log("Funbox 監控背景任務被取消")
+                raise
 
-            await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)
+            except Exception as e:
+                log(f"Funbox 監控背景任務錯誤：{type(e).__name__}: {e}")
+                await asyncio.sleep(30)
 
-        except Exception as e:
-            log(f"Funbox 監控背景任務錯誤：{e}")
-            await asyncio.sleep(30)
+    finally:
+        log("Funbox 監控背景任務已結束")
+
+
+def monitor_task_done(task: asyncio.Task):
+    if task.cancelled():
+        log("Funbox 監控 task 狀態：已取消")
+        return
+
+    error = task.exception()
+
+    if error is not None:
+        log(f"Funbox 監控 task 意外結束：{type(error).__name__}: {error}")
+    else:
+        log("Funbox 監控 task 已正常結束")
 
 
 @bot.event
 async def on_ready():
-    global monitor_started
+    global monitor_task
 
     log(f"已登入：{bot.user}")
     log("在 Discord 頻道輸入 !ping 測試")
@@ -1196,9 +1233,15 @@ async def on_ready():
     log("在 Discord 頻道輸入 !scanonce 手動掃描一次")
     log("在 Discord 頻道輸入 !resetalerts 清空已通知紀錄")
 
-    if not monitor_started:
-        monitor_started = True
-        bot.loop.create_task(monitor_funbox_loop())
+    if monitor_task is None or monitor_task.done():
+        monitor_task = asyncio.create_task(
+            monitor_funbox_loop(),
+            name="funbox-monitor",
+        )
+        monitor_task.add_done_callback(monitor_task_done)
+        log("已建立 Funbox 監控背景任務")
+    else:
+        log("Funbox 監控背景任務仍在執行，不重複建立")
 
 
 @bot.command(name="ping")
@@ -1254,6 +1297,8 @@ async def monitorstatus(ctx: commands.Context):
         f"價格上限：NT${FUNBOX_MAX_PRICE}\n"
         f"分類頁掃全部：{FUNBOX_CATEGORY_SCAN_ALL}\n"
         f"分類頁最多商品數：{FUNBOX_CATEGORY_MAX_PRODUCTS}\n"
+        f"背景任務：{'未建立' if monitor_task is None else ('執行中' if not monitor_task.done() else '已停止')}\n"
+        f"掃描鎖定中：{scan_lock.locked()}\n"
         f"已通知商品數：{len(alerted_products)}\n"
         f"白名單關鍵字：{keywords_text}\n"
         f"黑名單關鍵字：{excludes_text}\n"
