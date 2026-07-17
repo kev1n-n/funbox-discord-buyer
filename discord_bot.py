@@ -421,10 +421,10 @@ def collect_products_from_category(category_url: str) -> list[dict]:
 
             page.wait_for_timeout(3000)
 
-            for index in range(6):
+            for index in range(2):
                 page.mouse.wheel(0, 1200)
                 page.wait_for_timeout(1000)
-                log(f"分類頁滾動載入商品 {index + 1}/6")
+                log(f"分類頁滾動載入商品 {index + 1}/2")
 
             raw_products = page.evaluate(
                 """
