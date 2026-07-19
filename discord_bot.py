@@ -1187,14 +1187,26 @@ async def monitor_funbox_loop():
                     await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)
                     continue
 
-                log("開始新一輪 Funbox 掃描")
-                await scan_all_targets_once(send_alerts=True)
-                log(
-                    f"本輪 Funbox 掃描完成，"
-                    f"{FUNBOX_MONITOR_INTERVAL_SECONDS} 秒後再掃描"
+                log("開始新一輪 Funbox 掃描")  # 顯示新一輪掃描開始
+
+                try:  # 開始監控這一輪掃描是否卡住
+                    await asyncio.wait_for(  # 限制掃描最長執行時間
+                        scan_all_targets_once(send_alerts=True),  # 執行商品掃描並發送現貨通知
+                        timeout=180,  # 最多允許執行 180 秒
+                    )
+                except asyncio.TimeoutError:  # 掃描超過 180 秒時進入這裡
+                    log(  # 在 Zeabur Log 顯示 Watchdog 觸發
+                        "Funbox 掃描超過 180 秒，"
+                        "Watchdog 將重新啟動服務"
+                    )
+                    os._exit(1)  # 立即結束 Python 程序，讓 Zeabur 自動重啟
+
+                log(  # 顯示本輪正常完成
+                    f"本輪 Funbox 掃描完成，"  # 顯示掃描完成
+                    f"{FUNBOX_MONITOR_INTERVAL_SECONDS} 秒後再掃描"  # 顯示等待秒數
                 )
 
-                await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)
+                await asyncio.sleep(FUNBOX_MONITOR_INTERVAL_SECONDS)  # 非阻塞等待下一輪掃描
 
             except asyncio.CancelledError:
                 log("Funbox 監控背景任務被取消")
